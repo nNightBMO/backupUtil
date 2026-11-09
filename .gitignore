@@ -1,0 +1,51 @@
+# =============================================================================
+# ВАЖНО: рабочая папка утилиты одновременно содержит ваши архивы, логи и секреты
+# (telegram.toml, .secrets/, сессию Telegram, ключ age). Поэтому список «белый»:
+# игнорируется ВСЁ в корне, кроме перечисленных ниже файлов проекта.
+# =============================================================================
+/*
+
+# --- файлы проекта (добавляйте новые сюда явно) ---
+!/.gitignore
+!/.github/
+!/docs/
+!/tests/
+!/README.md
+!/LICENSE
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/SECURITY.md
+!/backup.sh
+!/restore.sh
+!/tg_upload.py
+!/tui.py
+!/bu_config.py
+!/backup.conf.example
+!/backup.env.example
+!/telegram.toml.example
+!/excludes.default.txt
+!/requirements.txt
+!/requirements-dev.txt
+!/pytest.ini
+
+# --- страховка: что бы ни оказалось внутри разрешённых папок, секреты и данные не коммитим ---
+telegram.toml
+backup.env
+backup.conf
+backup.conf.bak
+excludes.txt
+backup.log
+*.session
+*.session-journal
+*.key
+*.age
+*.tar.zst
+*.tar.zst.*
+*.sha256
+MANIFEST.txt
+.secrets/
+.state/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

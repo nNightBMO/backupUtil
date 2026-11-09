@@ -1,0 +1,26 @@
+# Скопируйте в telegram.toml:  cp telegram.toml.example telegram.toml && chmod 600 telegram.toml
+# Файл НЕ попадает в бэкап (папка ~/backupUtil исключается автоматически) и не публикуйте его.
+
+[telegram]
+api_id   = 1234567                                  # my.telegram.org → API development tools
+api_hash = "0123456789abcdef0123456789abcdef"
+# Группа с топиками: числовой id (-100…), @username или точное название.
+# Узнать: ./backup.sh tg groups
+group    = -1001234567890
+# session = "/свой/путь/tg.session"   # необязательно; по умолчанию .secrets/tg.session рядом со скриптами (права 600)
+
+# Сопоставление «папка → топик». НЕОБЯЗАТЕЛЬНО: если папки здесь нет, топик ищется
+# автоматически по названию, БЕЗ учёта регистра и ведущей точки
+# (code → «Code», .config → «Config», local-share → «Local share»).
+# Запись здесь имеет приоритет. Ключ — имя папки (регистр не важен), значение — id топика.
+# Список топиков: ./backup.sh tg topics
+[topics]
+"documents" = 12
+".ssh"      = 15
+
+# Метки для поиска «точек» в чате. Нужны только для полного бэкапа (всё из backup.conf).
+[autoback]
+log_topic   = "Logs"                  # id топика ИЛИ его название (регистр не важен)
+# date_format = "%d.%m.%Y"            # формат даты
+# log_message = "{date} autoback#{n}" # сообщение в топик логов в начале полного бэкапа
+# dir_message = "autoback#{n}"        # сообщение в топике каждой директории после её архивов

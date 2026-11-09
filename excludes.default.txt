@@ -1,0 +1,45 @@
+# Исключения для tar (--exclude-from), с секциями.
+#   [*]       — применяется к КАЖДОЙ директории (то, что безопасно исключать везде)
+#   [имя]     — только к директории с таким ИМЕНЕМ ПАПКИ из backup.conf (регистр важен)
+# Шаблон сопоставляется с концом пути: «node_modules» исключит такую папку на любой глубине.
+# Поэтому общие правила тут консервативные: имена вроде Cache или target могут быть
+# обычными папками в ваших исходниках — их исключаем только в секциях конкретных директорий.
+# Строки с # и пустые игнорируются.
+
+[*]
+node_modules
+__pycache__
+*.pyc
+.cache
+Trash
+.Trash-*
+lost+found
+.pnpm-store
+
+# --- профили приложений: кэши браузеров/Electron (Discord, VS Code, Chromium…) ---
+[.config]
+Cache
+Code Cache
+GPUCache
+GrShaderCache
+ShaderCache
+DawnCache
+CachedData
+Service Worker/CacheStorage
+blob_storage
+
+# если ~/.local/share лежит у вас в конфиге с именем local-share (см. backup.conf)
+[local-share]
+Trash
+baloo
+pnpm/store
+containers
+docker
+#Steam
+
+# --- по желанию: восстанавливаемые зависимости в проектах (добавьте секцию с именем вашей папки) ---
+#[code]
+#.venv
+#venv
+#target
+#.gradle/caches
