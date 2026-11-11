@@ -38,6 +38,22 @@ AUTOBACK_DEFAULTS = {
 TG_VOLUME_LIMIT_MIB = 2000  # лимит Telegram для обычного аккаунта
 
 
+# Имена папок, похожие на «секретные»: без шифрования такие архивы не стоит отправлять в Telegram.
+# (Должно совпадать с SENSITIVE_RE в tg_upload.py — это проверяет тест.)
+SENSITIVE_RE = re.compile(
+    r"(ssh|gnupg|gpg|secret|token|passw|pass-|keys?\b|wallet|keepass|aws|kube|\.config|"
+    r"mozilla|thunderbird|bitwarden|1password)", re.I)
+
+
+def human_size(n: int) -> str:
+    v = float(n)
+    for unit in ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ"):
+        if v < 1024 or unit == "ТиБ":
+            return f"{v:.0f} {unit}" if unit == "Б" else f"{v:.1f} {unit}"
+        v /= 1024
+    return f"{n} Б"
+
+
 def norm(s: str) -> str:
     """Сравнение имён папок и топиков: без регистра, без ведущей точки, без пробелов/_/-.
     (Должно совпадать с norm() в tg_upload.py — это проверяет тест.)"""
@@ -339,6 +355,51 @@ class Model:
             written.append(self.excl)
         self.dirty = False
         return written
+
+    def save_telegram(self) -> None:
+        """Записать только telegram.toml (перед сетевыми действиями в TUI): то же, что читает tg_upload.py."""
+        tg_id = self.tg.get("api_id", "").strip()
+        if tg_id and not re.fullmatch(r"\d+", tg_id):
+            raise ValueError("api_id должен быть числом")
+        text = dump_telegram_toml(self.tg, self.topics, self.ab, self.default_session)
+        old = self.toml.read_text(encoding="utf-8") if self.toml.exists() else None
+        if text != old:
+            atomic_write(self.toml, text, 0o600)
+
+    def archive_status(self, name: str) -> dict:
+        """Что собрано в папке архива и сколько томов уже отмечено в журнале выгрузки."""
+        d = self.root / name
+        mf = d / "MANIFEST.txt"
+        if not mf.exists():
+            return {"built": False}
+        info: dict[str, str] = {}
+        for line in mf.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                info.setdefault(k.strip(), v.strip())
+        vols: dict[str, str] = {}
+        shas = sorted(d.glob("*.sha256"))
+        if shas:
+            for line in shas[0].read_text(encoding="utf-8", errors="replace").splitlines():
+                m = re.match(r"^([0-9a-f]{64}) [ *](.+)$", line)
+                if m:
+                    vols[m.group(2)] = m.group(1)
+        sent: dict[str, str] = {}
+        journal = self.root / ".state" / "uploaded.jsonl"
+        if journal.exists():
+            for line in journal.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    rec = json.loads(line)
+                    sent[rec["key"].split("|", 2)[2]] = rec["sha256"]
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+        date = info.get("DATE", "")[:10]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            date = f"{date[8:]}.{date[5:7]}.{date[:4]}"
+        return {
+            "built": True, "date": date, "bytes": int(info.get("ARCHIVE_BYTES", "0") or 0),
+            "volumes": len(vols), "uploaded": sum(1 for fn, sha in vols.items() if sent.get(f"{name}/{fn}") == sha),
+        }
 
     # ---- вспомогательное для интерфейса
     def telegram_cfg(self) -> dict:

@@ -7,24 +7,36 @@ tui.py — терминальный интерфейс backupUtil (Textual).
 Вкладки:
   Источники   какие директории бэкапить: дерево каталогов, имя, режим (элементы/целиком), шифрование, sudo
   Топики      в какой топик Telegram какая директория уходит (список топиков берётся из группы)
-  Telegram    api_id / api_hash / группа / сессия, вход в аккаунт
+  Telegram    api_id / api_hash / группа / сессия, вход в аккаунт, диагностика соединения
   Параметры   размер тома, уровень zstd, нарезка, ключ age, формат меток autoback
   Исключения  редактор excludes.txt
-  Запуск      собрать / загрузить / всё сразу — выбор директорий и флагов, предпросмотр команды
+  Запуск      собрать / загрузить в Telegram / собрать и загрузить; статус архивов по директориям
+  Журнал      живой вывод сборки и загрузки (TUI не закрывается), история, остановка процесса
 
-Ctrl+S — сохранить всё, Ctrl+Q — выйти, F1 — помощь.
+Принцип: TUI — оболочка, а работу делают те же программы, что и в командной строке
+(backup.sh, tg_upload.py). Они запускаются дочерними процессами, их вывод идёт в «Журнал»
+и в файл .state/tui.log — поэтому поведение совпадает с CLI, а любая ошибка видна и сохраняется.
+
+Ctrl+S — сохранить всё, Ctrl+Q — выйти, F5 — журнал, F1 — помощь.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import time
+import traceback
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 
-from bu_config import Model, Source, expand
+from bu_config import SENSITIVE_RE, Model, Source, expand, human_size
 
 try:
     from rich.text import Text
@@ -34,105 +46,200 @@ try:
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen
     from textual.widgets import (Button, DataTable, DirectoryTree, Footer, Header, Input, Label, OptionList,
-                                 RadioButton, RadioSet, SelectionList, Static, Switch, TabbedContent, TabPane,
-                                 TextArea)
+                                 RadioButton, RadioSet, RichLog, SelectionList, Static, Switch, TabbedContent,
+                                 TabPane, TextArea)
     from textual.widgets.option_list import Option
+    from textual.worker import Worker, WorkerState
 except ImportError:  # pragma: no cover
     sys.exit("Не установлен textual. Выполните:\n"
              "  python -m venv .venv && .venv/bin/pip install -r requirements.txt")
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+LOG_LIMIT = 2 * 1024 * 1024  # размер .state/tui.log до ротации
+STOP_GRACE_INT = 6.0   # с: сколько ждать после SIGINT (мягкая остановка: trap в backup.sh чистит временные файлы)
+STOP_GRACE_TERM = 4.0  # с: сколько ждать после SIGTERM, затем SIGKILL
 
-# =========================================================================== Telegram (подменяется в тестах)
+
+# =========================================================================== процессы
+class ProcessRunner:
+    """Запускает команду и построчно отдаёт её вывод. Строки, оканчивающиеся на «\\r» (прогресс pv и загрузки),
+    уходят в on_progress, а не в журнал. Процесс — в своей группе, чтобы остановка снимала весь конвейер."""
+
+    def __init__(self, on_line, on_progress):
+        self.on_line, self.on_progress = on_line, on_progress
+        self.proc: asyncio.subprocess.Process | None = None
+        self.stopped = False
+        self._last_progress = False
+
+    async def run(self, argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> int:
+        full = {**os.environ, "PYTHONUNBUFFERED": "1", "BACKUPUTIL_NONINTERACTIVE": "1", "BACKUPUTIL_PV_FORCE": "1",
+                **(env or {})}
+        self.proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(cwd), env=full, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, process_group=0)
+        pump = asyncio.create_task(self._pump(self.proc.stdout))
+        try:
+            # Process.wait() в asyncio ждёт ещё и закрытия pipe: пока потомок держит вывод, оно зависает,
+            # хотя сам процесс уже завершился. Поэтому ждём по returncode, а хвост вывода — с ограничением.
+            while self.proc.returncode is None:
+                await asyncio.sleep(0.05)
+            try:
+                await asyncio.wait_for(asyncio.shield(pump), 2)
+            except (asyncio.TimeoutError, TimeoutError):
+                # потомки (например, фоновый цикл sudo) держат pipe открытым после выхода основного процесса
+                self.on_line("[WARN] после завершения остались фоновые процессы — останавливаю их")
+                self._kill_group()
+                pump.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pump
+        except asyncio.CancelledError:
+            self.stop(hard=True)
+            raise
+        return self.proc.returncode if self.proc.returncode is not None else -1
+
+    def _kill_group(self) -> None:
+        if self.proc is not None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def stop(self, hard: bool = False) -> None:
+        """Мягко: SIGINT → через STOP_GRACE_INT SIGTERM → через STOP_GRACE_TERM SIGKILL (всей группе процессов).
+        hard=True начинает сразу с SIGTERM. Лестница нужна, если SIGINT унаследован как «игнорируемый»
+        (запуск из лаунчера/nohup): тогда первый сигнал не подействует."""
+        if self.proc is None or self.proc.returncode is not None:
+            return
+        self.stopped = True
+        first = signal.SIGTERM if hard else signal.SIGINT
+        try:
+            os.killpg(self.proc.pid, first)
+        except (ProcessLookupError, PermissionError):
+            return
+        loop = asyncio.get_running_loop()
+        if hard:
+            loop.call_later(STOP_GRACE_TERM, self._escalate, signal.SIGKILL, None)
+        else:
+            loop.call_later(STOP_GRACE_INT, self._escalate, signal.SIGTERM, STOP_GRACE_TERM)
+
+    def _escalate(self, sig: int, then_after: float | None) -> None:
+        if self.proc is None or self.proc.returncode is not None:
+            return
+        try:
+            os.killpg(self.proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if then_after:
+            asyncio.get_running_loop().call_later(then_after, self._escalate, signal.SIGKILL, None)
+
+    def _emit(self, seg: bytes, progress: bool) -> None:
+        text = ANSI_RE.sub("", seg.decode("utf-8", errors="replace"))
+        if progress:
+            if text.strip():
+                self._last_progress = True
+                self.on_progress(text.strip())
+            return
+        if not text.strip() and self._last_progress:  # пустая строка после «\r»-прогресса — не нужна
+            self._last_progress = False
+            return
+        self._last_progress = False
+        self.on_progress("")
+        self.on_line(text.rstrip())
+
+    async def _pump(self, stream) -> None:
+        buf = b""
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                m = re.search(rb"[\r\n]", buf)
+                if not m:
+                    break
+                seg, sep, buf = buf[:m.start()], buf[m.start():m.end()], buf[m.end():]
+                if sep == b"\n":
+                    self._emit(seg, False)
+                elif buf.startswith(b"\n"):  # «\r\n»
+                    buf = buf[1:]
+                    self._emit(seg, False)
+                else:
+                    self._emit(seg, True)
+        if buf.strip():
+            self._emit(buf, False)
+        self.on_progress("")
+
+
+async def run_capture(argv: list[str], cwd: Path, on_stderr, timeout: float) -> tuple[int, str]:
+    """Запуск команды: stdout собирается целиком (JSON-ответ), stderr по строкам уходит в on_stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv, cwd=str(cwd), env={**os.environ, "PYTHONUNBUFFERED": "1"}, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, process_group=0)
+
+    async def read_err() -> None:
+        async for raw in proc.stderr:
+            on_stderr(ANSI_RE.sub("", raw.decode("utf-8", errors="replace")).rstrip("\r\n"))
+
+    def kill() -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    err_task = asyncio.create_task(read_err())
+    try:
+        out = await asyncio.wait_for(proc.stdout.read(), timeout)
+        await asyncio.wait_for(proc.wait(), 10)
+        await err_task
+    except (asyncio.TimeoutError, TimeoutError):
+        kill()
+        raise RuntimeError(f"Процесс не ответил за {int(timeout)} с и был остановлен") from None
+    except asyncio.CancelledError:
+        kill()
+        raise
+    return proc.returncode or 0, out.decode("utf-8", errors="replace")
+
+
+# =========================================================================== Telegram (через tg_upload.py)
 class Remote:
-    """Все обращения к Telegram. Вынесено в класс, чтобы тесты и интерфейс не зависели от сети."""
+    """Обращения к Telegram. Выполняет ТОТ ЖЕ tg_upload.py, что и командная строка, дочерним процессом:
+    поведение идентично CLI, а шаги диагностики попадают в журнал. Подменяется в тестах."""
 
-    @staticmethod
-    def _tg():
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    def _argv(self, model: Model, *args: str) -> list[str]:
+        return [sys.executable, str(self.root / "tg_upload.py"), "--config", str(model.toml), *args]
+
+    def login_argv(self, model: Model) -> list[str]:
+        return self._argv(model, "login")
+
+    async def _call(self, model: Model, args: list[str], log, timeout: float = 80) -> dict:
+        model.save_telegram()  # tg_upload читает файл: сохраняем то, что введено на вкладке «Telegram»
+        argv = self._argv(model, *args)
+        log("$ " + shlex.join(argv))
+        rc, out = await run_capture(argv, self.root, log, timeout)
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        if not lines:
+            raise RuntimeError(f"tg_upload.py не вернул ответа (код {rc}); подробности — в журнале")
         try:
-            import tg_upload
-        except SystemExit as e:  # tg_upload завершает процесс с сообщением, если нет telethon
-            raise RuntimeError(str(e)) from None
-        return tg_upload
+            data = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Неожиданный ответ tg_upload.py (код {rc}): {lines[-1][:200]}") from None
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error") or "неизвестная ошибка")
+        return data
 
-    async def _client(self, model: Model):
-        tg = self._tg()
-        cfg = model.telegram_cfg()
-        client = tg.make_client(cfg)
-        await client.connect()
-        tg.lock_session_files(cfg)
-        return tg, cfg, client
+    async def check(self, model: Model, log) -> str:
+        return (await self._call(model, ["check"], log))["text"]
 
-    async def _authorized(self, tg, client):
-        if not await client.is_user_authorized():
-            raise RuntimeError("Сессия не авторизована — нажмите «Войти» на вкладке Telegram")
+    async def topics(self, model: Model, log) -> dict[int, str]:
+        data = await self._call(model, ["topics", "--json"], log)
+        return {int(k): v for k, v in data["topics"].items()}
 
-    async def check(self, model: Model) -> str:
-        tg, cfg, client = await self._client(model)
-        try:
-            await self._authorized(tg, client)
-            me = await client.get_me()
-            text = f"Вход выполнен: {me.first_name} (@{me.username})"
-            if cfg["group"] is not None:
-                try:
-                    entity = await tg.resolve_group(client, cfg["group"])
-                    kind = "форум" if getattr(entity, "forum", False) else "НЕ форум (топиков нет)"
-                    text += f"\nГруппа: {getattr(entity, 'title', entity)} — {kind}"
-                except SystemExit as e:
-                    text += f"\nГруппа не найдена: {e}"
-            return text
-        finally:
-            await client.disconnect()
-
-    async def topics(self, model: Model) -> dict[int, str]:
-        tg, cfg, client = await self._client(model)
-        try:
-            await self._authorized(tg, client)
-            try:
-                entity = await tg.resolve_group(client, cfg["group"])
-            except SystemExit as e:
-                raise RuntimeError(str(e)) from None
-            if not getattr(entity, "forum", False):
-                raise RuntimeError("Эта группа не форум — включите «Темы» в настройках группы")
-            return await tg.fetch_topics(client, entity)
-        finally:
-            await client.disconnect()
-
-    async def groups(self, model: Model) -> list[tuple[int, str, str]]:
-        tg, cfg, client = await self._client(model)
-        try:
-            await self._authorized(tg, client)
-            out = []
-            async for d in client.iter_dialogs():
-                if getattr(d.entity, "megagroup", False):
-                    out.append((d.id, "forum" if getattr(d.entity, "forum", False) else "group", d.name))
-            return out
-        finally:
-            await client.disconnect()
-
-    async def login(self, app: "BackupUtilApp", model: Model) -> str:
-        tg, cfg, client = await self._client(model)
-        try:
-            if await client.is_user_authorized():
-                return "Уже авторизованы"
-            phone = await app.ask("Телефон в международном формате", placeholder="+998901234567")
-            if not phone:
-                return "Отменено"
-            await client.send_code_request(phone.strip())
-            code = await app.ask("Код из Telegram (придёт в приложение или SMS)")
-            if not code:
-                return "Отменено"
-            try:
-                await client.sign_in(phone.strip(), code.strip())
-            except tg.errors.SessionPasswordNeededError:
-                pw = await app.ask("Пароль двухфакторной защиты (2FA)", password=True)
-                if not pw:
-                    return "Отменено"
-                await client.sign_in(password=pw)
-            tg.lock_session_files(cfg)
-            me = await client.get_me()
-            return f"Вход выполнен: {me.first_name} (@{me.username}). Сессия сохранена (права 600)"
-        finally:
-            await client.disconnect()
+    async def groups(self, model: Model, log) -> list[tuple[int, str, str]]:
+        data = await self._call(model, ["groups", "--json"], log)
+        return [(g["id"], g["kind"], g["title"]) for g in data["groups"]]
 
 
 def generate_age_key(root: Path) -> str:
@@ -162,7 +269,7 @@ def to_tilde(path: str | Path) -> str:
 
 
 def build_command(root: Path, mode: str, layout: str, dry: bool, delete_after: bool, encrypt_all: bool,
-                  single: bool, fresh: bool, selected: list[str], all_names: list[str]) -> list[str]:
+                  single: bool, fresh: bool, selected: list[str], all_names: list[str], yes: bool = False) -> list[str]:
     """Команда backup.sh по выбранным на вкладке «Запуск» опциям."""
     cmd = [str(root / "backup.sh"), mode]
     if dry:
@@ -179,9 +286,21 @@ def build_command(root: Path, mode: str, layout: str, dry: bool, delete_after: b
             cmd.append("--delete-after-upload")
         if fresh:
             cmd.append("--fresh")
+    if yes:
+        cmd.append("--yes")
     if selected and set(selected) != set(all_names):
         cmd += ["--", *selected]
     return cmd
+
+
+def infer_level(text: str) -> str:
+    if "[ERR]" in text or text.startswith(("Traceback", "FAIL")) or "СТОП" in text:
+        return "err"
+    if "[WARN]" in text:
+        return "warn"
+    if "✓" in text or text.startswith("[OK]") or "готово —" in text:
+        return "ok"
+    return "info"
 
 
 # =========================================================================== модальные окна
@@ -371,15 +490,18 @@ class SourceEditModal(ModalScreen):
 
 
 HELP_TEXT = """\
-Ctrl+S  сохранить всё            Ctrl+Q  выйти
-Вкладки: Источники · Топики · Telegram · Параметры · Исключения · Запуск
+Ctrl+S  сохранить всё      Ctrl+Q  выйти      F5  журнал
+Вкладки: Источники · Топики · Telegram · Параметры · Исключения · Запуск · Журнал
 
 Источники:  a — добавить из дерева, p — по пути, e — изменить, d — удалить
-Топики:     «Загрузить топики» подтягивает список из группы; клавиша t или кнопка «Назначить топик» — выбрать топик для строки.
+Топики:     «Загрузить топики» подтягивает список из группы; клавиша t или кнопка «Назначить топик».
             Если ничего не назначено, топик ищется по названию папки без учёта регистра.
-Запуск:     перед стартом всё сохраняется; TUI на время уступает терминал backup.sh
-            (там пароль sudo, прогресс и ввод), затем возвращается.
+Telegram:   «Войти» на время открывает терминал (код и пароль 2FA вводятся там, как в ./backup.sh tg login);
+            «Проверить» пошагово диагностирует сеть, сессию, аккаунт и группу — шаги видны в «Журнале».
+Запуск:     собрать / загрузить в Telegram / всё сразу. TUI не закрывается: вывод идёт в «Журнал»,
+            остановить процесс можно кнопкой там же.
 
+Всё, что делает TUI, пишется в .state/tui.log — приложите его к сообщению об ошибке.
 Файлы: backup.conf, backup.env, telegram.toml (chmod 600), excludes.txt — лежат рядом со скриптами.
 """
 
@@ -392,6 +514,8 @@ INPUT_FIELDS = {
     "p-dirmsg": ("ab", "dir_message"), "p-logtopic": ("ab", "log_topic"),
 }
 SWITCH_FIELDS = {"p-split": "SPLIT", "p-onefs": "ONE_FS"}
+LOG_STYLES = {"err": "bold red", "warn": "yellow", "ok": "green", "dim": "dim", "info": ""}
+RUN_MODES = {"run-build": "build", "run-upload": "upload", "run-all": "all"}
 
 
 def cell(text: object) -> Text:
@@ -416,6 +540,8 @@ class BackupUtilApp(App):
     #pick-list { height: 1fr; }
     #excl-text { height: 1fr; }
     #run-src { height: 10; }
+    #log-view { height: 1fr; border: round $primary-darken-2; }
+    #log-progress { height: auto; color: $warning; }
     #cols { height: 1fr; }
     #cols > Vertical { width: 1fr; height: 100%; padding-right: 1; }
     """
@@ -423,6 +549,7 @@ class BackupUtilApp(App):
         Binding("ctrl+s", "save", "Сохранить"),
         Binding("ctrl+q", "request_quit", "Выход"),
         Binding("f1", "help", "Помощь"),
+        Binding("f5", "show_log", "Журнал"),
         Binding("a", "src_add_tree", "Добавить"),
         Binding("p", "src_add_path", "По пути"),
         Binding("e", "src_edit", "Изменить"),
@@ -434,9 +561,15 @@ class BackupUtilApp(App):
         super().__init__()
         self.model = Model(root)
         self.model.load()
-        self.remote = remote or Remote()
+        self.remote = remote or Remote(root)
         self.titles: dict[int, str] = {}
         self.sub_title = ""
+        self.busy = False          # идёт сборка/загрузка
+        self.net_busy = False      # идёт запрос к Telegram
+        self.runner: ProcessRunner | None = None
+        self.log_history: list[tuple[str, str]] = []
+        self.status_texts: dict[str, str] = {}
+        self.log_path = Path(root) / ".state" / "tui.log"
 
     # ------------------------------------------------------------------ раскладка
     def compose(self) -> ComposeResult:
@@ -462,7 +595,7 @@ class BackupUtilApp(App):
                         yield DataTable(id="grp-table", cursor_type="row", zebra_stripes=True)
                 with Horizontal(classes="btnrow"):
                     yield Button("Загрузить топики из Telegram", id="top-fetch", variant="primary")
-                    yield Button("Назначить топик", id="top-assign")
+                    yield Button("Назначить топик (t)", id="top-assign")
                     yield Button("Сбросить на авто", id="top-reset")
                     yield Button("Топик логов (autoback)", id="top-log")
                 yield Static(id="top-status", classes="hint", markup=False)
@@ -479,9 +612,11 @@ class BackupUtilApp(App):
                     with Horizontal(classes="btnrow"):
                         yield Button("Показать/скрыть api_hash", id="tg-show-hash")
                         yield Button("Войти в аккаунт", id="tg-login", variant="primary")
+                        yield Button("Проверить соединение", id="tg-check", variant="success")
                         yield Button("Выбрать группу", id="tg-pick-group")
-                        yield Button("Проверить", id="tg-check")
                     yield Static(id="tg-status", classes="hint", markup=False)
+                    yield Static("Шаги проверки и ошибки подробно — на вкладке «Журнал» (F5) и в файле .state/tui.log.",
+                                 classes="hint", markup=False)
             with TabPane("Параметры", id="tab-par"):
                 with VerticalScroll():
                     yield Label("Размер тома (K/M/G; для Telegram меньше 2000M)", classes="field")
@@ -517,17 +652,17 @@ class BackupUtilApp(App):
                     yield Button("Вернуть список по умолчанию", id="excl-default")
             with TabPane("Запуск", id="tab-run"):
                 with VerticalScroll():
-                    yield Label("Режим", classes="dlg-title")
-                    with RadioSet(id="run-mode"):
-                        yield RadioButton("build — только собрать архивы", id="mode-build", value=True)
-                        yield RadioButton("upload — только загрузить собранное", id="mode-upload")
-                        yield RadioButton("all — собрать и загрузить", id="mode-all")
+                    yield Label("Что сделать (ход работы — на вкладке «Журнал»)", classes="dlg-title")
+                    with Horizontal(classes="btnrow"):
+                        yield Button("Собрать архивы", id="run-build", variant="primary")
+                        yield Button("Загрузить в Telegram", id="run-upload", variant="success")
+                        yield Button("Собрать и загрузить", id="run-all", variant="warning")
                     yield Label("Раскладка архивов", classes="dlg-title field")
                     with RadioSet(id="run-layout"):
                         yield RadioButton("как в backup.conf", id="lay-config", value=True)
                         yield RadioButton("--items: каждый элемент — свой архив", id="lay-items")
                         yield RadioButton("--whole: вся директория одним архивом", id="lay-whole")
-                    for sid, text in (("run-dry", "Пробный запуск (--dry-run): ничего не писать"),
+                    for sid, text in (("run-dry", "Пробный запуск (--dry-run): ничего не писать и не отправлять"),
                                       ("run-single", "Без нарезки на тома (--single)"),
                                       ("run-encrypt", "Шифровать всё (--encrypt)"),
                                       ("run-delete", "Удалить локальные тома после выгрузки (--delete-after-upload)"),
@@ -535,11 +670,21 @@ class BackupUtilApp(App):
                         with Horizontal(classes="swrow"):
                             yield Switch(value=False, id=sid)
                             yield Label(" " + text, markup=False)
-                    yield Label("Директории (все выбраны = полный бэкап с метками autoback#N)", classes="dlg-title field")
+                    yield Label("Директории и их состояние (все выбраны = полный бэкап с метками autoback#N)",
+                                classes="dlg-title field")
                     yield SelectionList[str](id="run-src")
                     yield Static(id="run-cmd", classes="hint", markup=False)
-                    with Horizontal(classes="btnrow"):
-                        yield Button("Сохранить и запустить", id="run-go", variant="success")
+            with TabPane("Журнал", id="tab-log"):
+                yield RichLog(id="log-view", wrap=True, markup=False, highlight=False, max_lines=20000)
+                yield Static(id="log-progress", markup=False)
+                with Horizontal(classes="btnrow"):
+                    yield Button("Остановить", id="log-stop", variant="error", disabled=True)
+                    yield Button("Очистить", id="log-clear")
+                    yield Button("Показать backup.log", id="log-load")
+                with Horizontal(classes="swrow"):
+                    yield Switch(value=True, id="log-follow")
+                    yield Label(" Автопрокрутка", markup=False)
+                yield Static("Ожидание", id="log-status", markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -548,6 +693,95 @@ class BackupUtilApp(App):
         self.query_one("#grp-table", DataTable).add_columns("ID", "Название")
         self.refresh_all()
         self._update_title()
+        try:
+            asyncio.get_running_loop().set_exception_handler(self._loop_exception)
+        except RuntimeError:
+            pass
+        self.log_line("dim", f"backupUtil TUI запущен · рабочая папка {self.model.root} · журнал: {self.log_path}")
+
+    # ------------------------------------------------------------------ журнал
+    def _file_log(self, level: str, text: str) -> None:
+        try:
+            self.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if self.log_path.exists() and self.log_path.stat().st_size > LOG_LIMIT:
+                self.log_path.replace(self.log_path.with_suffix(".log.1"))
+            fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%F %T')} [{level}] {text}\n")
+        except OSError:
+            pass
+
+    def log_line(self, level: str, text: str) -> None:
+        """Строка в вкладку «Журнал», в историю и в .state/tui.log."""
+        self.log_history.append((level, text))
+        del self.log_history[:-5000]
+        self._file_log(level, text)
+        try:
+            self.query_one("#log-view", RichLog).write(Text(text, style=LOG_STYLES.get(level, "")))
+        except Exception:  # noqa: BLE001 — интерфейс ещё не собран или уже закрывается
+            pass
+
+    def _proc_line(self, text: str) -> None:
+        self.log_line(infer_level(text), text)
+
+    def _proc_progress(self, text: str) -> None:
+        try:
+            self.query_one("#log-progress", Static).update(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _loop_exception(self, loop, context) -> None:
+        exc = context.get("exception")
+        self.log_line("err", f"Необработанная ошибка asyncio: {context.get('message')} {exc!r}")
+        if exc:
+            self.log_line("err", "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+
+    def _handle_exception(self, error: Exception) -> None:  # type: ignore[override]
+        self._file_log("err", "СБОЙ TUI:\n" + "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+        super()._handle_exception(error)
+
+    @on(Worker.StateChanged)
+    def _worker_state(self, event: Worker.StateChanged) -> None:
+        if event.state == WorkerState.ERROR and event.worker.error is not None:
+            err = event.worker.error
+            self.log_line("err", "Сбой фоновой задачи:\n" + "".join(traceback.format_exception(type(err), err, err.__traceback__)))
+
+    def action_show_log(self) -> None:
+        self.show_tab("tab-log")
+
+    def show_tab(self, tab_id: str) -> None:
+        """Переключить вкладку. TabbedContent сам возвращается на вкладку, где остался фокус (например, на
+        нажатой или только что отключённой кнопке) — поэтому фокус переводим внутрь целевой вкладки и
+        несколько раз проверяем, что она удержалась."""
+        self._goto_tab(tab_id)
+        self.set_timer(0.05, partial(self._recheck_tab, tab_id, 8))
+
+    def _goto_tab(self, tab_id: str) -> None:
+        tc = self.query_one(TabbedContent)
+        tc.active = tab_id
+        try:
+            for w in tc.get_pane(tab_id).query("*"):
+                if w.can_focus:
+                    w.focus()
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+        self.set_focus(None)
+
+    def _recheck_tab(self, tab_id: str, left: int) -> None:
+        if left > 0 and self.query_one(TabbedContent).active != tab_id:
+            self._goto_tab(tab_id)
+            self.set_timer(0.1, partial(self._recheck_tab, tab_id, left - 1))
+
+    def set_status(self, widget_id: str, text: str) -> None:
+        self.status_texts[widget_id] = text
+        try:
+            self.query_one(widget_id, Static).update(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def say(self, text: str, severity: str = "information") -> None:
+        self.notify(text, severity=severity, markup=False)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------ обновление данных
     def touch(self) -> None:
@@ -555,7 +789,11 @@ class BackupUtilApp(App):
         self._update_title()
 
     def _update_title(self) -> None:
-        self.sub_title = "● есть несохранённые изменения (Ctrl+S)" if self.model.dirty else "сохранено"
+        parts = []
+        if self.busy:
+            parts.append("⏳ идёт процесс")
+        parts.append("● есть несохранённые изменения (Ctrl+S)" if self.model.dirty else "сохранено")
+        self.sub_title = " · ".join(parts)
 
     def refresh_all(self) -> None:
         self.refresh_sources()
@@ -592,16 +830,25 @@ class BackupUtilApp(App):
         for tid, title in sorted(self.titles.items()):
             g.add_row(cell(tid), cell(title), key=str(tid))
         lt = self.model.ab.get("log_topic", "")
-        self.query_one("#top-status", Static).update(
-            f"Топиков загружено: {len(self.titles)}. Топик логов: {lt or 'не задан (нужен для полного бэкапа)'}")
+        if "#top-status" not in self.status_texts or self.status_texts["#top-status"].startswith("Топиков загружено"):
+            self.set_status("#top-status",
+                            f"Топиков загружено: {len(self.titles)}. Топик логов: {lt or 'не задан (нужен для полного бэкапа)'}")
+
+    def _src_label(self, s: Source) -> str:
+        st = self.model.archive_status(s.effective_name())
+        if not st["built"]:
+            state = "не собрано"
+        else:
+            up = f"загружено {st['uploaded']}/{st['volumes']}" if st["volumes"] else "—"
+            state = f"собрано {st['date']} · {human_size(st['bytes'])} · {up}"
+        return f"{s.effective_name()}  ←  {s.path}   [{state}]"
 
     def refresh_run(self) -> None:
         sl = self.query_one("#run-src", SelectionList)
         keep = set(sl.selected) if sl.option_count else None
         sl.clear_options()
-        names = [s.effective_name() for s in self.model.sources]
-        sl.add_options([(Text(f"{n}  ←  {s.path}"), n, keep is None or n in keep)
-                        for n, s in zip(names, self.model.sources)])
+        sl.add_options([(Text(self._src_label(s)), s.effective_name(), keep is None or s.effective_name() in keep)
+                        for s in self.model.sources])
         self.update_run_preview()
 
     def refresh_preview(self) -> None:
@@ -639,6 +886,8 @@ class BackupUtilApp(App):
                 self.touch()
         elif sid.startswith("run-"):
             self.update_run_preview()
+        elif sid == "log-follow":
+            self.query_one("#log-view", RichLog).auto_scroll = event.value
 
     @on(TextArea.Changed, "#excl-text")
     def _excl_changed(self, event: TextArea.Changed) -> None:
@@ -659,25 +908,26 @@ class BackupUtilApp(App):
         pressed = self.query_one(rs_id, RadioSet).pressed_button
         return (pressed.id or "")[len(prefix):] if pressed else ""
 
-    def run_command(self) -> list[str]:
-        sw = lambda i: self.query_one(i, Switch).value  # noqa: E731
+    def run_command(self, mode: str = "build", yes: bool = False) -> list[str]:
+        def sw(i: str) -> bool:
+            return self.query_one(i, Switch).value
         selected = list(self.query_one("#run-src", SelectionList).selected)
         names = [s.effective_name() for s in self.model.sources]
-        return build_command(self.model.root, self._radio_value("#run-mode", "mode-") or "build",
-                             self._radio_value("#run-layout", "lay-") or "config", sw("#run-dry"),
+        return build_command(self.model.root, mode, self._radio_value("#run-layout", "lay-") or "config", sw("#run-dry"),
                              sw("#run-delete"), sw("#run-encrypt"), sw("#run-single"), sw("#run-fresh"),
-                             selected, names)
+                             selected, names, yes)
 
     def update_run_preview(self) -> None:
         try:
             sel = self.query_one("#run-src", SelectionList).selected
+            if not sel:
+                self.query_one("#run-cmd", Static).update("Выберите хотя бы одну директорию")
+                return
+            lines = [f"{label}: " + " ".join(shlex.quote(c) for c in self.run_command(mode))
+                     for label, mode in (("Собрать", "build"), ("Загрузить", "upload"), ("Всё", "all"))]
+            self.query_one("#run-cmd", Static).update("\n".join(lines))
         except Exception:  # noqa: BLE001 — интерфейс ещё не собран
             return
-        if not sel:
-            self.query_one("#run-cmd", Static).update("Выберите хотя бы одну директорию")
-            return
-        cmd = self.run_command()
-        self.query_one("#run-cmd", Static).update("Команда: " + " ".join(shlex.quote(c) for c in cmd))
 
     # ------------------------------------------------------------------ действия: общие
     def _active_tab(self) -> str:
@@ -693,27 +943,40 @@ class BackupUtilApp(App):
             self.push_screen(ConfirmModal("Не сохранено: исправьте ошибки", str(e), [("Понятно", "ok", "primary")]))
             return False
         except OSError as e:
-            self.notify(f"Ошибка записи: {e}", severity="error")
+            self.say(f"Ошибка записи: {e}", "error")
             return False
         self._update_title()
-        self.notify("Сохранено: " + (", ".join(p.name for p in written) if written else "изменений нет"))
+        self.say("Сохранено: " + (", ".join(p.name for p in written) if written else "изменений нет"))
         return True
 
     def action_request_quit(self) -> None:
-        if not self.model.dirty:
+        def finish() -> None:
+            if self.runner:
+                self.runner.stop(hard=True)
             self.exit()
-            return
 
-        def done(key: str | None) -> None:
+        def done_busy(key: str | None) -> None:
+            if key == "stop":
+                finish()
+
+        def done_dirty(key: str | None) -> None:
             if key == "save":
                 if self.action_save():
-                    self.exit()
+                    finish()
             elif key == "discard":
-                self.exit()
+                finish()
 
-        self.push_screen(ConfirmModal("Выход", "Есть несохранённые изменения.",
-                                      [("Сохранить и выйти", "save", "success"), ("Выйти без сохранения", "discard", "error"),
-                                       ("Отмена", "cancel", "default")]), done)
+        if self.busy:
+            self.push_screen(ConfirmModal("Выход", "Сейчас идёт процесс (сборка или загрузка). Остановить его и выйти?",
+                                          [("Остановить и выйти", "stop", "error"), ("Остаться", "stay", "primary")]),
+                             done_busy)
+        elif self.model.dirty:
+            self.push_screen(ConfirmModal("Выход", "Есть несохранённые изменения.",
+                                          [("Сохранить и выйти", "save", "success"),
+                                           ("Выйти без сохранения", "discard", "error"), ("Отмена", "cancel", "default")]),
+                             done_dirty)
+        else:
+            finish()
 
     # ------------------------------------------------------------------ действия: источники
     def _cursor_source(self, table_id: str = "#src-table") -> int | None:
@@ -728,10 +991,10 @@ class BackupUtilApp(App):
         new = Source(path=path)
         target = expand(path)
         if any(expand(s.path) == target for s in self.model.sources):
-            self.notify("Эта директория уже в списке", severity="warning")
+            self.say("Эта директория уже в списке", "warning")
             return
         if not target.is_dir():
-            self.notify(f"Внимание: {target} сейчас не существует (запись всё равно добавлена)", severity="warning")
+            self.say(f"Внимание: {target} сейчас не существует (запись всё равно добавлена)", "warning")
         self.model.sources.append(new)
         self.touch()
         self.refresh_all()
@@ -799,28 +1062,58 @@ class BackupUtilApp(App):
     def _b4(self) -> None:
         self.action_src_delete()
 
-    # ------------------------------------------------------------------ действия: топики
+    # ------------------------------------------------------------------ Telegram: общая обвязка
     async def ask(self, title: str, value: str = "", placeholder: str = "", password: bool = False) -> str | None:
-        """Ввод строки из воркера (нужен для многошаговой авторизации)."""
+        """Ввод строки из воркера."""
         return await self.push_screen_wait(PromptModal(title, value, placeholder, password))
 
-    def _set_status(self, widget_id: str, text: str) -> None:
-        self.query_one(widget_id, Static).update(text)
+    def _net_guard(self) -> bool:
+        if self.busy:
+            self.say("Идёт сборка/загрузка: сессия Telegram занята — дождитесь завершения", "warning")
+            return False
+        if self.net_busy:
+            self.say("Предыдущий запрос к Telegram ещё выполняется", "warning")
+            return False
+        return True
 
+    async def _net_job(self, label: str, status_id: str, make_coro, on_ok) -> None:
+        """Запрос к Telegram: статус, журнал, понятная ошибка вместо молчания. Ничего не бросает наружу."""
+        self.net_busy = True
+        self.set_status(status_id, f"{label}…")
+        self.log_line("dim", f"— {label}")
+        try:
+            result = await make_coro()
+        except asyncio.CancelledError:
+            self.log_line("warn", f"{label}: отменено")
+            raise
+        except BaseException as e:  # noqa: BLE001 — в т.ч. SystemExit из чужого кода: интерфейс не должен падать
+            msg = str(e) or type(e).__name__
+            if not isinstance(e, (RuntimeError, ValueError)):
+                msg = f"{type(e).__name__}: {msg}"
+                self.log_line("err", "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+            self.log_line("err", f"{label}: {msg}")
+            self.set_status(status_id, f"Ошибка: {msg}   (подробности — вкладка «Журнал», F5)")
+            self.say(f"{label}: {msg}", "error")
+        else:
+            on_ok(result)
+        finally:
+            self.net_busy = False
+
+    # ------------------------------------------------------------------ Telegram: топики
     @on(Button.Pressed, "#top-fetch")
     def _fetch_topics(self) -> None:
-        self.run_worker(self._fetch_topics_job(), exclusive=True, group="net")
+        if self._net_guard():
+            self.run_worker(self._net_job("Загрузка топиков", "#top-status",
+                                          lambda: self.remote.topics(self.model, self._proc_line), self._topics_loaded),
+                            exclusive=True, group="net", exit_on_error=False)
 
-    async def _fetch_topics_job(self) -> None:
-        self._set_status("#top-status", "Подключаюсь к Telegram…")
-        try:
-            self.titles = await self.remote.topics(self.model)
-        except Exception as e:  # noqa: BLE001 — любая сетевая/конфигурационная ошибка → в интерфейс
-            self._set_status("#top-status", f"Ошибка: {e}")
-            self.notify(f"Не удалось получить топики: {e}", severity="error")
-            return
+    def _topics_loaded(self, titles: dict[int, str]) -> None:
+        self.titles = titles
+        self.log_line("ok", f"✓ Топиков получено: {len(titles)}")
+        self.set_status("#top-status", f"Топиков загружено: {len(titles)}. Топик логов: "
+                                       f"{self.model.ab.get('log_topic') or 'не задан (нужен для полного бэкапа)'}")
         self.refresh_all()
-        self.notify(f"Топиков получено: {len(self.titles)}")
+        self.say(f"Топиков получено: {len(titles)}")
 
     def _topic_options(self) -> list[tuple[str, object]]:
         opts: list[tuple[str, object]] = [(f"{t}   ·   id {i}", i) for i, t in sorted(self.titles.items())]
@@ -836,7 +1129,7 @@ class BackupUtilApp(App):
                 if text is None:
                     return
                 if not re.fullmatch(r"\d+", text.strip()):
-                    self.notify("id топика — целое число", severity="error")
+                    self.say("id топика — целое число", "error")
                     return
                 self._store_topic(name, int(text.strip()))
             self.push_screen(PromptModal(f"id топика для «{name}»", placeholder="например 12"), typed)
@@ -857,7 +1150,7 @@ class BackupUtilApp(App):
     def _assign_topic(self) -> None:
         idx = self._cursor_source("#top-table")
         if idx is None:
-            self.notify("Сначала добавьте директории на вкладке «Источники»", severity="warning")
+            self.say("Сначала добавьте директории на вкладке «Источники»", "warning")
             return
         name = self.model.sources[idx].effective_name()
         hint = "" if self.titles else "Список топиков не загружен — можно ввести id вручную"
@@ -889,7 +1182,7 @@ class BackupUtilApp(App):
 
         self.push_screen(PickModal("Топик для меток autoback (логов)", self._topic_options()), picked)
 
-    # ------------------------------------------------------------------ действия: Telegram
+    # ------------------------------------------------------------------ Telegram: вход, проверка, группа
     @on(Button.Pressed, "#tg-show-hash")
     def _toggle_hash(self) -> None:
         inp = self.query_one("#tg-api-hash", Input)
@@ -897,60 +1190,80 @@ class BackupUtilApp(App):
 
     @on(Button.Pressed, "#tg-login")
     def _login(self) -> None:
-        self.run_worker(self._login_job(), exclusive=True, group="net")
-
-    async def _login_job(self) -> None:
-        self._set_status("#tg-status", "Вход…")
+        """Вход выполняет tg_upload.py login в настоящем терминале: телефон, код и пароль 2FA вводятся там же,
+        как в ./backup.sh tg login. TUI на это время приостанавливается и затем возвращается."""
+        if not self._net_guard():
+            return
         try:
-            msg = await self.remote.login(self, self.model)
-        except Exception as e:  # noqa: BLE001
-            msg = f"Ошибка входа: {e}"
-        self._set_status("#tg-status", msg)
-        self.notify(msg)
+            self.model.save_telegram()
+            argv = self.remote.login_argv(self.model)
+        except ValueError as e:
+            self.say(str(e), "error")
+            return
+        self.log_line("dim", "$ " + shlex.join(argv))
+        rc: int | None = None
+        try:
+            with self.suspend():
+                print("\n=== Вход в Telegram (то же, что ./backup.sh tg login) ===\n")
+                rc = subprocess.run(argv, cwd=self.model.root, check=False).returncode
+                try:
+                    input("\n[Enter — вернуться в TUI] ")
+                except (EOFError, OSError):
+                    pass
+        except Exception as e:  # noqa: BLE001 — например, терминал не поддерживает приостановку
+            self.log_line("err", f"Не удалось приостановить TUI для входа: {e!r}. Выполните в терминале: ./backup.sh tg login")
+            self.set_status("#tg-status", "Вход: выполните в терминале ./backup.sh tg login")
+            return
+        if rc == 0:
+            self.log_line("ok", "✓ Вход выполнен (tg_upload.py login завершился успешно)")
+            self.set_status("#tg-status", "Вход выполнен. Нажмите «Проверить соединение».")
+            self._check()
+        else:
+            self.log_line("err", f"Вход не удался: код возврата {rc}")
+            self.set_status("#tg-status", f"Вход не удался (код {rc}); см. вывод выше или «Журнал»")
 
     @on(Button.Pressed, "#tg-check")
     def _check(self) -> None:
-        self.run_worker(self._check_job(), exclusive=True, group="net")
+        if self._net_guard():
+            self.show_tab("tab-log")  # шаги диагностики — сразу на виду
+            self.run_worker(self._net_job("Проверка соединения", "#tg-status",
+                                          lambda: self.remote.check(self.model, self._proc_line), self._check_ok),
+                            exclusive=True, group="net", exit_on_error=False)
 
-    async def _check_job(self) -> None:
-        self._set_status("#tg-status", "Проверяю…")
-        try:
-            msg = await self.remote.check(self.model)
-        except Exception as e:  # noqa: BLE001
-            msg = f"Ошибка: {e}"
-        self._set_status("#tg-status", msg)
+    def _check_ok(self, text: str) -> None:
+        self.log_line("ok", "✓ " + text.replace("\n", " · "))
+        self.set_status("#tg-status", text)
 
     @on(Button.Pressed, "#tg-pick-group")
     def _pick_group(self) -> None:
-        self.run_worker(self._pick_group_job(), exclusive=True, group="net")
+        if self._net_guard():
+            self.run_worker(self._pick_group_job(), exclusive=True, group="net", exit_on_error=False)
 
     async def _pick_group_job(self) -> None:
-        self._set_status("#tg-status", "Загружаю список групп…")
-        try:
-            groups = await self.remote.groups(self.model)
-        except Exception as e:  # noqa: BLE001
-            self._set_status("#tg-status", f"Ошибка: {e}")
+        holder: list[list[tuple[int, str, str]]] = []
+        await self._net_job("Список групп", "#tg-status", lambda: self.remote.groups(self.model, self._proc_line), holder.append)
+        if not holder:
             return
-        forums = [g for g in groups if g[1] == "forum"]
-        self._set_status("#tg-status", f"Групп найдено: {len(groups)}, из них форумов: {len(forums)}")
+        forums = [g for g in holder[0] if g[1] == "forum"]
+        self.set_status("#tg-status", f"Групп найдено: {len(holder[0])}, из них форумов: {len(forums)}")
         if not forums:
-            self.notify("Нет групп с включёнными темами (форумов)", severity="warning")
+            self.say("Нет групп с включёнными темами (форумов)", "warning")
             return
         res = await self.push_screen_wait(PickModal("Выберите группу-форум", [(f"{n}   ·   {i}", i) for i, _, n in forums]))
         if res is not None:
             self.query_one("#tg-group", Input).value = str(res[0])
 
-    # ------------------------------------------------------------------ действия: параметры
+    # ------------------------------------------------------------------ параметры
     @on(Button.Pressed, "#p-genkey")
     def _gen_key(self) -> None:
         try:
             pub = generate_age_key(self.model.root)
         except RuntimeError as e:
-            self.notify(str(e), severity="error", timeout=10)
+            self.say(str(e), "error")
             return
         self.query_one("#p-age", Input).value = pub
         self.notify("Ключ создан: .secrets/age.key. СОХРАНИТЕ его отдельно — без него зашифрованные архивы не открыть.",
-                    timeout=12)
+                    timeout=12, markup=False)
 
     @on(Button.Pressed, "#excl-default")
     def _excl_default(self) -> None:
@@ -958,31 +1271,162 @@ class BackupUtilApp(App):
         text = p.read_text(encoding="utf-8") if p.exists() else ""
         self.query_one("#excl-text", TextArea).load_text(text)
 
-    # ------------------------------------------------------------------ запуск backup.sh
-    @on(Button.Pressed, "#run-go")
-    def _run_go(self) -> None:
-        if not self.query_one("#run-src", SelectionList).selected:
-            self.notify("Выберите хотя бы одну директорию", severity="warning")
+    # ------------------------------------------------------------------ запуск: сборка / загрузка
+    @on(Button.Pressed, "#run-build")
+    @on(Button.Pressed, "#run-upload")
+    @on(Button.Pressed, "#run-all")
+    def _run_pressed(self, event: Button.Pressed) -> None:
+        mode = RUN_MODES[event.button.id or ""]
+        self.run_worker(self._run_flow(mode), exclusive=True, group="run", exit_on_error=False)
+
+    async def _ensure_sudo(self) -> bool:
+        ok = await asyncio.to_thread(lambda: subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0)
+        if ok:
+            return True
+        self.log_line("info", "Нужен sudo для системных директорий: подтвердите пароль в терминале…")
+        try:
+            with self.suspend():
+                print("\nДля чтения системных директорий нужен sudo. Введите пароль:\n")
+                rc = subprocess.run(["sudo", "-v"], check=False).returncode
+        except Exception as e:  # noqa: BLE001
+            self.log_line("err", f"Не удалось запросить sudo: {e!r}. Выполните в терминале sudo -v и повторите")
+            return False
+        return rc == 0
+
+    async def _run_flow(self, mode: str) -> None:
+        try:
+            await self._run_flow_inner(mode)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:  # noqa: BLE001
+            self.log_line("err", "Сбой запуска:\n" + "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+            self.say(f"Сбой запуска: {e!r}", "error")
+            self.busy = False
+            self._set_running_ui(False)
+
+    async def _run_flow_inner(self, mode: str) -> None:
+        if self.busy:
+            self.say("Процесс уже выполняется — дождитесь завершения или остановите его в «Журнале»", "warning")
+            return
+        if self.net_busy:
+            self.say("Дождитесь завершения запроса к Telegram", "warning")
+            return
+        selected = list(self.query_one("#run-src", SelectionList).selected)
+        if not selected:
+            self.say("Выберите хотя бы одну директорию", "warning")
             return
         if self.model.dirty and not self.action_save():
             return
-        cmd = self.run_command()
-        with self.suspend():
-            print("\n$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
-            try:
-                subprocess.run(cmd, cwd=self.model.root, check=False)
-            except KeyboardInterrupt:
-                print("\nПрервано.")
-            try:
-                input("\n[Enter — вернуться в TUI] ")
-            except EOFError:
-                pass
+        chosen = [s for s in self.model.sources if s.effective_name() in selected]
+        dry = self.query_one("#run-dry", Switch).value
+        enc_all = self.query_one("#run-encrypt", Switch).value
+        delete = self.query_one("#run-delete", Switch).value
+
+        if mode in ("build", "all") and any(s.needs_sudo() for s in chosen):
+            if not await self._ensure_sudo():
+                self.log_line("err", "Запуск отменён: sudo не подтверждён")
+                self.show_tab("tab-log")
+                return
+
+        yes = False
+        if mode in ("upload", "all") and not dry:
+            risky = [s.effective_name() for s in chosen
+                     if SENSITIVE_RE.search(s.effective_name()) and not (s.encrypt or enc_all)]
+            if risky:
+                ans = await self.push_screen_wait(ConfirmModal(
+                    "Незашифрованные «секретные» папки",
+                    "Чаты Telegram не имеют сквозного шифрования. Эти папки уйдут БЕЗ шифрования:\n  "
+                    + "\n  ".join(risky) + "\n\nВключить шифрование можно на вкладке «Источники» (e → Шифровать age).",
+                    [("Всё равно загрузить", "yes", "error"), ("Отмена", "no", "primary")]))
+                if ans != "yes":
+                    self.log_line("warn", "Загрузка отменена пользователем (незашифрованные секретные папки)")
+                    return
+                yes = True
+            if delete:
+                ans = await self.push_screen_wait(ConfirmModal(
+                    "Удалить локальные тома после выгрузки?",
+                    "После успешной загрузки локальные тома будут УДАЛЕНЫ (останутся .sha256 и MANIFEST.txt).",
+                    [("Да, удалять", "yes", "error"), ("Отмена", "no", "primary")]))
+                if ans != "yes":
+                    self.log_line("warn", "Запуск отменён пользователем (удаление локальных томов)")
+                    return
+                yes = True
+
+        argv = self.run_command(mode, yes=yes)
+        title = {"build": "Сборка", "upload": "Загрузка в Telegram", "all": "Сборка и загрузка"}[mode]
+        await self._execute(title + (" (пробный запуск)" if dry else ""), argv)
+
+    def _set_running_ui(self, running: bool) -> None:
+        for bid in RUN_MODES:
+            self.query_one(f"#{bid}", Button).disabled = running
+        self.query_one("#log-stop", Button).disabled = not running
+        self._update_title()
+
+    async def _execute(self, title: str, argv: list[str]) -> None:
+        self.show_tab("tab-log")        # сначала уводим фокус с кнопок запуска, затем блокируем их
+        self.busy = True
+        self._set_running_ui(True)
+        self.set_status("#log-status", f"▶ {title}…")
+        self.log_line("dim", f"════ {title} · {time.strftime('%F %T')} ════")
+        self.log_line("dim", "$ " + shlex.join(argv))
+        self.runner = ProcessRunner(self._proc_line, self._proc_progress)
+        code: int | None = None
+        try:
+            code = await self.runner.run(argv, self.model.root)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:  # noqa: BLE001
+            self.log_line("err", f"Не удалось запустить: {e!r}")
+        finally:
+            stopped = self.runner.stopped if self.runner else False
+            self.busy = False
+            self._set_running_ui(False)
+            self._proc_progress("")
+        if code == 0:
+            self.log_line("ok", f"✓ {title}: завершено успешно")
+            self.set_status("#log-status", f"✓ {title}: завершено успешно")
+            self.say(f"{title}: завершено успешно")
+        else:
+            why = "остановлено пользователем" if stopped else f"код возврата {code}"
+            self.log_line("err", f"✗ {title}: {why}")
+            self.set_status("#log-status", f"✗ {title}: {why}")
+            self.say(f"{title}: {why} — см. «Журнал»", "error")
         self.refresh_all()
+
+    # ------------------------------------------------------------------ вкладка «Журнал»
+    @on(Button.Pressed, "#log-stop")
+    def _stop(self) -> None:
+        if self.runner and self.busy:
+            self.log_line("warn", f"Остановка… (Ctrl+C процессу; если не завершится — через {STOP_GRACE_INT:.0f} с SIGTERM, затем SIGKILL)")
+            self.runner.stop()
+
+    @on(Button.Pressed, "#log-clear")
+    def _clear_log(self) -> None:
+        self.query_one("#log-view", RichLog).clear()
+        self.log_history.clear()
+
+    @on(Button.Pressed, "#log-load")
+    def _load_backup_log(self) -> None:
+        p = self.model.root / "backup.log"
+        if not p.exists():
+            self.say("backup.log ещё не создан", "warning")
+            return
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-300:]
+        self.log_line("dim", f"──── последние {len(lines)} строк backup.log ────")
+        for ln in lines:
+            self._proc_line(ln)
+        self.log_line("dim", "──── конец backup.log ────")
 
 
 def main() -> int:
     root = Path(__file__).resolve().parent
-    BackupUtilApp(root).run()
+    app = BackupUtilApp(root)
+    try:
+        app.run()
+    except BaseException:
+        app._file_log("err", "СБОЙ TUI (верхний уровень):\n" + traceback.format_exc())
+        print(f"\nTUI аварийно завершился. Подробности: {app.log_path}", file=sys.stderr)
+        raise
     return 0
 
 

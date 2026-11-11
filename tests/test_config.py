@@ -120,3 +120,47 @@ def test_source_sudo_and_name():
     assert B.Source("/etc").needs_sudo() and not B.Source("~/code").needs_sudo()
     assert B.Source("~/.config").effective_name() == ".config"
     assert B.Source("~/x", name="y").effective_name() == "y"
+
+
+def test_sensitive_pattern_matches_uploader():
+    tg = pytest.importorskip("tg_upload")
+    assert tg.SENSITIVE_RE.pattern == B.SENSITIVE_RE.pattern
+    assert B.SENSITIVE_RE.search(".ssh") and B.SENSITIVE_RE.search("gnupg") and not B.SENSITIVE_RE.search("Documents")
+
+
+def test_human_size():
+    assert B.human_size(500) == "500 Б" and B.human_size(1887436800) == "1.8 ГиБ" and B.human_size(2048) == "2.0 КиБ"
+
+
+def test_save_telegram_writes_only_toml(root):
+    m = B.Model(root)
+    m.load()
+    m.tg.update(api_id="12", api_hash="h" * 32, group="@grp")
+    m.sources = [B.Source("~/code")]
+    m.save_telegram()
+    assert (root / "telegram.toml").exists() and not (root / "backup.conf").exists()
+    assert stat.S_IMODE((root / "telegram.toml").stat().st_mode) == 0o600
+    m.tg["api_id"] = "abc"
+    with pytest.raises(ValueError):
+        m.save_telegram()
+
+
+def test_archive_status(root):
+    import hashlib
+    import json
+    m = B.Model(root)
+    m.load()
+    assert m.archive_status("code") == {"built": False}
+    d = root / "code"
+    d.mkdir()
+    (d / "a.tar.zst.000").write_bytes(b"1")
+    (d / "a.tar.zst.001").write_bytes(b"2")
+    (d / "code.sha256").write_text("\n".join(f"{hashlib.sha256(x).hexdigest()}  a.tar.zst.00{i}" for i, x in enumerate((b"1", b"2"))) + "\n")
+    (d / "MANIFEST.txt").write_text("DATE=2026-11-07T10:00:00+05:00\nARCHIVE_BYTES=1234\n")
+    st = m.archive_status("code")
+    assert st == {"built": True, "date": "07.11.2026", "bytes": 1234, "volumes": 2, "uploaded": 0}
+    (root / ".state").mkdir()
+    rec = {"key": "-100|11|code/a.tar.zst.001", "sha256": hashlib.sha256(b"2").hexdigest()}
+    bad = {"key": "-100|11|code/a.tar.zst.000", "sha256": "0" * 64}              # другой sha — не считается загруженным
+    (root / ".state" / "uploaded.jsonl").write_text(json.dumps(rec) + "\n" + json.dumps(bad) + "\nмусор\n")
+    assert m.archive_status("code")["uploaded"] == 1

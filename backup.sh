@@ -189,8 +189,12 @@ select_sources() {
 # ------------------------------ sudo / проверки -------------------------------
 sudo_init() {
     [[ -n $SUDO_PID ]] && return 0
-    log INFO "Нужен sudo (для директорий вне \$HOME). Запрашиваю пароль один раз…"
-    sudo -v || die "sudo недоступен"
+    if [[ -n ${BACKUPUTIL_NONINTERACTIVE:-} ]]; then   # запуск из TUI: пароль спрашивать нечем
+        sudo -n -v 2>/dev/null || die "sudo не авторизован: подтвердите пароль в TUI (или выполните sudo -v в терминале)"
+    else
+        log INFO "Нужен sudo (для директорий вне \$HOME). Запрашиваю пароль один раз…"
+        sudo -v || die "sudo недоступен"
+    fi
     ( while true; do sudo -n true 2>/dev/null || exit; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
     SUDO_PID=$!
 }
@@ -281,7 +285,11 @@ summarize_items() {  # file → "число_элементов сумма_бай
 }
 
 # ---------------------------- этапы конвейера ---------------------------------
-stage_progress() { if (($2)) && (($1 > 0)); then pv -pterb -s "$1"; else cat; fi; }
+stage_progress() {
+    local -a o=(-pterb)
+    [[ -n ${BACKUPUTIL_PV_FORCE:-} ]] && o+=(-f)   # TUI читает вывод из pipe — pv без -f молчит
+    if (($2)) && (($1 > 0)); then pv "${o[@]}" -s "$1"; else cat; fi
+}
 stage_encrypt()  { if (($1)); then age "${AGE_ARGS[@]}"; else cat; fi; }
 stage_write()    { if ((SPLIT)); then split -b "$VOLUME_SIZE" -d -a 3 - "$1"; else cat >"$1"; fi; }
 

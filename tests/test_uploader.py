@@ -180,3 +180,158 @@ def test_topics_fallback_from_service_messages():
 
     got = asyncio.run(T.topics_from_service_messages(C(), None))
     assert got == {11: "Renamed", 12: "Config", 1: "General"}
+
+
+# =========================================================================== JSON-контракт для TUI
+import socket  # noqa: E402
+import sys  # noqa: E402
+
+
+class AuthClient:
+    """Клиент для check/topics/groups."""
+    def __init__(self, authorized=True, hang=False):
+        self.authorized, self.hang = authorized, hang
+
+    async def connect(self):
+        if self.hang:
+            await asyncio.sleep(60)
+
+    async def is_user_authorized(self):
+        return self.authorized
+
+    async def get_me(self):
+        return types.SimpleNamespace(first_name="Имя", username="user")
+
+    async def disconnect(self):
+        pass
+
+    async def iter_dialogs(self):
+        for i, (name, forum) in enumerate((("Backups", True), ("Chat", False)), 1):
+            yield types.SimpleNamespace(id=-100 - i, name=name, entity=types.SimpleNamespace(megagroup=True, forum=forum))
+
+
+@pytest.fixture()
+def cli(tmp_path, monkeypatch, capsys):
+    toml = tmp_path / "telegram.toml"
+    toml.write_text('[telegram]\napi_id=1\napi_hash="x"\ngroup=-100\nsession="%s"\n' % (tmp_path / "s" / "tg.session"))
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    monkeypatch.setattr(T, "LOGFILE", tmp_path / "backup.log")
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: (_ for _ in ()).throw(OSError("нет сети")))
+
+    def call(*args, client=None, forum=True):
+        client = client or AuthClient()
+
+        async def connect(cfg, quick=False):
+            if not client.authorized:
+                sys.exit("Сессия не авторизована. Сначала выполните: ./backup.sh tg login")
+            return client
+
+        async def group(c, g):
+            return types.SimpleNamespace(forum=forum, title="Backups")
+
+        async def topics(c, e):
+            return {1: "General", 11: "Code"}
+
+        monkeypatch.setattr(T, "connect_authorized", connect)
+        monkeypatch.setattr(T, "make_client", lambda cfg, quick=False: client)
+        monkeypatch.setattr(T, "resolve_group", group)
+        monkeypatch.setattr(T, "fetch_topics", topics)
+        monkeypatch.setattr(sys, "argv", ["tg_upload.py", "--config", str(toml), *args])
+        rc = T.main()
+        out, err = capsys.readouterr()
+        return rc, out, err
+
+    call.toml = toml
+    return call
+
+
+def last_json(out: str) -> dict:
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 1, f"в stdout должна быть ровно одна строка JSON, а там: {out!r}"
+    return json.loads(lines[0])
+
+
+def test_check_ok_prints_steps_to_stderr_and_json_to_stdout(cli):
+    rc, out, err = cli("check")
+    data = last_json(out)
+    assert rc == 0 and data["ok"] and "Вход выполнен: Имя (@user)" in data["text"] and "Backups — форум" in data["text"]
+    assert "Python " in err and "Telethon" in err and "Сеть: Telegram DC2" in err and "НЕДОСТИЖИМ" in err
+
+
+def test_check_unauthorized_is_clear_json_error(cli):
+    rc, out, err = cli("check", client=AuthClient(authorized=False))
+    assert rc == 1 and last_json(out) == {"ok": False, "error": "Сессия не авторизована. Сначала выполните: ./backup.sh tg login"} \
+        or "не авторизована" in last_json(out)["error"]
+
+
+def test_check_reports_unauthorized_after_connect(cli):
+    class NoAuth(AuthClient):
+        async def is_user_authorized(self):
+            return False
+
+    # check использует make_client напрямую (не connect_authorized)
+    rc, out, err = cli("check", client=NoAuth())
+    assert rc == 1 and "не авторизована" in last_json(out)["error"]
+
+
+def test_hanging_connection_is_cut_by_timeout_with_clear_message(cli):
+    rc, out, err = cli("--timeout", "1", "check", client=AuthClient(hang=True))
+    assert rc == 1
+    assert "Таймаут 1 с" in last_json(out)["error"] and "VPN" in last_json(out)["error"]
+
+
+def test_quick_connect_message_mentions_handshake():
+    with pytest.raises(ConnectionError, match="рукопожатие MTProto"):
+        asyncio.run(T.quick_connect(AuthClient(hang=True), 0.2))
+
+
+def test_topics_json(cli):
+    rc, out, err = cli("topics", "--json")
+    assert rc == 0 and last_json(out) == {"ok": True, "group": "Backups", "topics": {"1": "General", "11": "Code"}}
+
+
+def test_topics_json_not_a_forum(cli):
+    rc, out, err = cli("topics", "--json", forum=False)
+    assert rc == 1 and "не форум" in last_json(out)["error"]
+
+
+def test_groups_json(cli):
+    rc, out, err = cli("groups", "--json")
+    assert rc == 0 and last_json(out)["groups"] == [{"id": -101, "kind": "forum", "title": "Backups"},
+                                                    {"id": -102, "kind": "group", "title": "Chat"}]
+
+
+def test_groups_human_output_still_works(cli):
+    rc, out, err = cli("groups")
+    assert rc == 0 and "forum" in out and "Backups" in out
+
+
+def test_json_error_when_config_missing(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["tg_upload.py", "--config", str(tmp_path / "нет.toml"), "check"])
+    rc = T.main()
+    out, _ = capsys.readouterr()
+    assert rc == 1 and "Нет файла" in last_json(out)["error"]
+
+
+def test_stdout_stays_clean_when_permissions_get_fixed(cli):
+    cli.toml.chmod(0o644)
+    rc, out, err = cli("topics", "--json")
+    assert rc == 0 and last_json(out)["ok"]            # уведомление о правах ушло в stderr
+    assert "установлены 600" in err
+    assert oct(cli.toml.stat().st_mode & 0o777) == "0o600"
+
+
+def test_unexpected_exception_in_json_mode_becomes_error_not_traceback_on_stdout(cli):
+    class Boom(AuthClient):
+        async def get_me(self):
+            raise ValueError("странный сбой")
+
+    rc, out, err = cli("check", client=Boom())
+    assert rc == 1 and "ValueError: странный сбой" in last_json(out)["error"] and "Traceback" in err
+
+
+def test_log_goes_to_stderr_only(capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "LOGFILE", tmp_path / "x.log")
+    T.log("INFO", "привет")
+    out, err = capsys.readouterr()
+    assert out == "" and "привет" in err

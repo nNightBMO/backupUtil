@@ -11,10 +11,10 @@ tg_upload.py — выгрузка архивов в Telegram-группу с т�
 
 Метки (только при upload):
   полный бэкап (--full: все директории из backup.conf)
-      1) в топик логов:                  «01.01.2027 autoback#1»
+      1) в топик логов:                  «07.11.2026 autoback#1»
       2) после архивов каждой директории: «autoback#1»  (в её топике)
   частичный (одна или несколько директорий)
-      после архивов каждой директории:   «01.01.2027»   (в её топике), больше нигде ничего
+      после архивов каждой директории:   «07.11.2026»   (в её топике), больше нигде ничего
 Дата — дата СОЗДАНИЯ бэкапа (из MANIFEST.txt). Номер autoback# растёт на 1 с каждым
 завершённым полным бэкапом (.state/autoback.json); прерванный полный бэкап при повторном
 запуске продолжается под тем же номером (--fresh — начать новый).
@@ -68,7 +68,7 @@ def log(level: str, msg: str) -> None:
     line = f"{time.strftime('%F %T')} [{level}] tg: {msg}"
     with open(LOGFILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
-    print(line if level != "INFO" else msg, file=sys.stderr if level == "ERR" else sys.stdout, flush=True)
+    print(line if level != "INFO" else msg, file=sys.stderr, flush=True)  # stdout — только данные/JSON
 
 
 def mib(n: float) -> float:
@@ -106,7 +106,7 @@ def load_config(path: Path) -> dict:
         sys.exit(f"Нет файла {path}. Скопируйте telegram.toml.example → telegram.toml и заполните.")
     if path.stat().st_mode & 0o077:
         path.chmod(0o600)
-        print(f"[!] Права на {path} были слишком широкими — установлены 600")
+        print(f"[!] Права на {path} были слишком широкими — установлены 600", file=sys.stderr)
     with path.open("rb") as f:
         raw = tomllib.load(f)
     try:
@@ -127,27 +127,55 @@ def load_config(path: Path) -> dict:
         sys.exit(f"В {path} не хватает поля {e}")
 
 
-def make_client(cfg: dict) -> TelegramClient:
+def make_client(cfg: dict, quick: bool = False) -> TelegramClient:
+    """quick=True — для проверок/списков: быстрый отказ вместо минутных повторов при проблемах с сетью."""
     cfg["session"].parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     return TelegramClient(
         str(cfg["session"]), cfg["api_id"], cfg["api_hash"],
-        connection_retries=10, retry_delay=5, request_retries=10,
+        connection_retries=2 if quick else 10, retry_delay=2 if quick else 5,
+        request_retries=3 if quick else 10, timeout=10,
         auto_reconnect=True, flood_sleep_threshold=60,
     )
 
 
 def lock_session_files(cfg: dict) -> None:
-    for p in cfg["session"].parent.glob(cfg["session"].name + "*"):
+    parent = cfg["session"].parent
+    if not parent.is_dir():
+        return
+    for p in parent.glob(cfg["session"].name + "*"):
         p.chmod(0o600)
-    cfg["session"].parent.chmod(0o700)
+    parent.chmod(0o700)
 
 
-async def connect_authorized(cfg: dict) -> TelegramClient:
-    client = make_client(cfg)
-    await client.connect()
+CONNECT_TIMEOUT = 25  # с: сколько ждать установки соединения в быстрых командах
+
+
+async def quick_connect(client: TelegramClient, seconds: int = CONNECT_TIMEOUT) -> None:
+    """connect() без собственного таймаута может висеть минутами (рукопожатие MTProto без ответа)."""
+    try:
+        await asyncio.wait_for(client.connect(), seconds)
+    except (TimeoutError, asyncio.TimeoutError):
+        raise ConnectionError(
+            f"Нет ответа от Telegram за {seconds} с при установке соединения: TCP-порт открыт, но рукопожатие MTProto "
+            "не завершилось. Проверьте VPN/прокси/фаервол и повторите (подробности — в журнале)") from None
+
+
+async def safe_disconnect(client: TelegramClient, seconds: int = 5) -> None:
+    try:
+        await asyncio.wait_for(client.disconnect(), seconds)
+    except Exception:  # noqa: BLE001 — при отключении ошибки не важны
+        pass
+
+
+async def connect_authorized(cfg: dict, quick: bool = False) -> TelegramClient:
+    client = make_client(cfg, quick)
+    if quick:
+        await quick_connect(client)
+    else:
+        await client.connect()
     lock_session_files(cfg)
     if not await client.is_user_authorized():
-        await client.disconnect()
+        await safe_disconnect(client)
         sys.exit("Сессия не авторизована. Сначала выполните: ./backup.sh tg login")
     return client
 
@@ -386,28 +414,45 @@ async def cmd_login(cfg: dict, args) -> int:
     return 0
 
 
+def emit(obj: dict) -> None:
+    """Машиночитаемый ответ (одна строка JSON в stdout) — для TUI и скриптов."""
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
 async def cmd_groups(cfg: dict, args) -> int:
-    client = await connect_authorized(cfg)
+    client = await connect_authorized(cfg, quick=True)
     try:
-        print("id\t\t\tтип\tназвание")
+        rows = []
         async for d in client.iter_dialogs():
             e = d.entity
             if getattr(e, "megagroup", False):
-                print(f"{d.id}\t{'forum' if getattr(e, 'forum', False) else 'group'}\t{d.name}")
+                rows.append({"id": d.id, "kind": "forum" if getattr(e, "forum", False) else "group", "title": d.name})
+        if args.json:
+            emit({"ok": True, "groups": rows})
+            return 0
+        print("id\t\t\tтип\tназвание")
+        for r in rows:
+            print(f"{r['id']}\t{r['kind']}\t{r['title']}")
         print("\nНужна строка с типом forum. Её id → поле group в telegram.toml.")
     finally:
-        await client.disconnect()
+        await safe_disconnect(client)
     return 0
 
 
 async def cmd_topics(cfg: dict, args) -> int:
-    client = await connect_authorized(cfg)
+    client = await connect_authorized(cfg, quick=True)
     try:
         entity = await resolve_group(client, args.group if args.group is not None else cfg["group"])
         if not getattr(entity, "forum", False):
-            print("Эта группа не форум (темы не включены) — топиков нет.")
+            if args.json:
+                emit({"ok": False, "error": "Эта группа не форум (темы не включены) — топиков нет"})
+            else:
+                print("Эта группа не форум (темы не включены) — топиков нет.")
             return 1
         topics = await fetch_topics(client, entity)
+        if args.json:
+            emit({"ok": True, "group": str(getattr(entity, "title", "")), "topics": {str(i): t for i, t in topics.items()}})
+            return 0
         print(f"Группа: {getattr(entity, 'title', entity)}\n\nID\tНазвание")
         for i, t in sorted(topics.items()):
             print(f"{i}\t{t}")
@@ -418,6 +463,53 @@ async def cmd_topics(cfg: dict, args) -> int:
     finally:
         await client.disconnect()
     return 0
+
+
+async def cmd_check(cfg: dict, args) -> int:
+    """Пошаговая диагностика: окружение → сеть → сессия → аккаунт → группа. Шаги — в stderr, итог — JSON."""
+    import socket
+
+    def say(msg: str) -> None:
+        log("INFO", msg)
+
+    say(f"Python {sys.version.split()[0]}, Telethon {telethon.__version__}")
+    say(f"api_id={cfg['api_id']}, group={cfg['group']!r}")
+    sess = Path(str(cfg["session"]) if str(cfg["session"]).endswith(".session") else str(cfg["session"]) + ".session")
+    if sess.exists():
+        say(f"Сессия: {sess} (права {oct(sess.stat().st_mode & 0o777)})")
+    else:
+        say(f"Сессия: файла {sess} нет — понадобится вход (login)")
+
+    def tcp() -> str:
+        try:
+            socket.create_connection(("149.154.167.51", 443), timeout=5).close()
+            return "достижим"
+        except OSError as e:
+            return f"НЕДОСТИЖИМ ({e})"
+
+    say("Сеть: Telegram DC2 149.154.167.51:443 — " + await asyncio.to_thread(tcp))
+    say("Подключение к Telegram…")
+    client = make_client(cfg, quick=True)
+    try:
+        await quick_connect(client)
+        say("Соединение установлено")
+        if not await client.is_user_authorized():
+            raise RuntimeError("Сессия не авторизована — нажмите «Войти в аккаунт» (или ./backup.sh tg login)")
+        me = await client.get_me()
+        text = f"Вход выполнен: {me.first_name} (@{me.username})"
+        say(text)
+        if cfg["group"] is None:
+            text += "\nГруппа не задана"
+        else:
+            entity = await resolve_group(client, cfg["group"])
+            kind = "форум" if getattr(entity, "forum", False) else "НЕ форум (топиков нет)"
+            say(f"Группа: {getattr(entity, 'title', entity)} — {kind}")
+            text += f"\nГруппа: {getattr(entity, 'title', entity)} — {kind}"
+        lock_session_files(cfg)
+        emit({"ok": True, "text": text})
+        return 0
+    finally:
+        await safe_disconnect(client)
 
 
 async def upload_dir(client, entity, cfg, journal: Journal, d: Path, topic: int, ab_n, args) -> bool:
@@ -624,11 +716,16 @@ async def cmd_upload(cfg: dict, args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=ROOT / "telegram.toml", help="путь к telegram.toml")
+    ap.add_argument("--timeout", type=int, default=60,
+                    help="общий таймаут (с) для check/groups/topics; 0 — без ограничения (по умолчанию 60)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="авторизоваться и сохранить сессию")
-    sub.add_parser("groups", help="показать ваши супергруппы")
+    gp = sub.add_parser("groups", help="показать ваши супергруппы")
+    gp.add_argument("--json", action="store_true", help="ответ в JSON (для TUI)")
     tp = sub.add_parser("topics", help="показать топики форумной группы")
     tp.add_argument("--group", default=None, help="переопределить group из конфига (id или @username)")
+    tp.add_argument("--json", action="store_true", help="ответ в JSON (для TUI)")
+    sub.add_parser("check", help="диагностика: сеть, сессия, аккаунт, группа (итог — JSON)")
     up = sub.add_parser("upload", help="загрузить собранные архивы")
     up.add_argument("names", nargs="*", help="имена папок (по умолчанию — все собранные)")
     up.add_argument("--full", action="store_true",
@@ -640,13 +737,46 @@ def main() -> int:
     up.add_argument("-y", "--yes", action="store_true", help="не задавать вопросов")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
-    handler = {"login": cmd_login, "groups": cmd_groups, "topics": cmd_topics, "upload": cmd_upload}[args.cmd]
+    want_json = args.cmd == "check" or getattr(args, "json", False)
     try:
-        return asyncio.run(handler(cfg, args))
+        cfg = load_config(args.config)
+    except SystemExit as e:
+        if want_json:
+            emit({"ok": False, "error": str(e.code)})
+            return 1
+        raise
+    handler = {"login": cmd_login, "groups": cmd_groups, "topics": cmd_topics, "upload": cmd_upload,
+               "check": cmd_check}[args.cmd]
+    try:
+        coro = handler(cfg, args)
+        if args.cmd in ("check", "groups", "topics") and args.timeout > 0:
+            coro = asyncio.wait_for(coro, args.timeout)
+        return asyncio.run(coro)
     except KeyboardInterrupt:
-        print("\nПрервано. Перезапустите команду — уже загруженные тома будут пропущены.")
+        print("\nПрервано. Перезапустите команду — уже загруженные тома будут пропущены.", file=sys.stderr)
         return 130
+    except SystemExit as e:  # ожидаемые ошибки с понятным текстом
+        if want_json and isinstance(e.code, str):
+            log("ERR", e.code)
+            emit({"ok": False, "error": e.code})
+            return 1
+        raise
+    except Exception as e:  # noqa: BLE001
+        if not want_json:
+            raise
+        import traceback
+        if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
+            msg = (f"Таймаут {args.timeout} с: Telegram не ответил. Проверьте сеть/прокси/VPN "
+                   "(шаги диагностики — в журнале)")
+            log("ERR", msg)
+        elif isinstance(e, ConnectionError):
+            msg = str(e)
+            log("ERR", msg)
+        else:
+            log("ERR", traceback.format_exc())
+            msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        emit({"ok": False, "error": msg})
+        return 1
 
 
 if __name__ == "__main__":

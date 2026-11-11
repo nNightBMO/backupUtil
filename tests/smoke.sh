@@ -62,6 +62,13 @@ rm -rf "$HOME/code/projB"
 ./backup.sh build code --items --single >/dev/null
 [[ -f code/projA.tar.zst && ! -e code/projA.tar.zst.000 ]] || fail "--single"
 
+if command -v pv >/dev/null; then
+  echo "== прогресс pv доходит до pipe (так его читает TUI)"
+  head -c 9000000 /dev/zero > "$HOME/code/zeros.bin"
+  out="$(BACKUPUTIL_PV_FORCE=1 BACKUPUTIL_NONINTERACTIVE=1 ./backup.sh build code 2>&1 | tr '\r' '\n')"
+  grep -qE '[0-9]+%|[0-9]+(\.[0-9]+)? ?[KMG]iB' <<<"$out" || fail "pv не вывел прогресс в pipe при BACKUPUTIL_PV_FORCE"
+fi
+
 echo "== конфиг: backup.sh list видит имена и режимы"
 out="$(./backup.sh list)"; grep -q "^code" <<<"$out" || fail "list"
 
